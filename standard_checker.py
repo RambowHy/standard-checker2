@@ -50,7 +50,7 @@ class StandardChecker:
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
     
-    def query_single(self, standard_no: str) -> Tuple[str, str, List[dict]]:
+    def query_single(self, standard_no: str) -> Tuple[Optional[str], Optional[str], List[dict]]:
         """
         查询单个标准
         
