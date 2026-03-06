@@ -1,4 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
+# PyInstaller 打包配置文件
+# 用法: pyinstaller 标准查询工具.spec
 
 block_cipher = None
 
@@ -7,11 +9,18 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['pandas', 'requests', 'openpyxl'],
+    hiddenimports=[
+        'pandas',
+        'pandas._libs.tslibs.base',
+        'requests',
+        'openpyxl',
+        'openpyxl.cell._writer',
+        'xlsxwriter',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['tkinter', 'matplotlib', 'numpy.f2py'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
