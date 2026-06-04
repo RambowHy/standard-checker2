@@ -46,6 +46,7 @@ Thumbs.db
 *.tmp
 *.bak
 *.log
+*.pkl
 
 # 环境变量和敏感信息（虽然当前没有，但预防性添加）
 .env
