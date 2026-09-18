@@ -55,7 +55,7 @@ python standard_checker.py -f input.xlsx --proxy http://127.0.0.1:7890
 ## ndls.org.cn API 契约
 
 - `POST /api/standard/list`，body `{"a100": 标准号, "page": 1, "limit": 10}`；仅在以下情况重试（指数退避 `delay * 2**retry_count + 随机抖动`，默认间隔 5s、最多 3 次）：`code != 0` 且 message 含「限流」/「验证码」、HTTP 429、5xx、超时/连接异常；4xx（非 429）立即失败不重试。
-- 批量循环把 `sleep_after=(i < total)` 传给 `query_single`，最后一条不再 sleep；单条查询默认仍 sleep。HTTP 超时由构造参数 `timeout` 控制（默认 15s）。
+- 批量循环把 `sleep_after=(i < total)` 传给 `query_single`，最后一条不再 sleep；单条查询默认仍 sleep。成功后的间隔走 `_random_delay()`：`delay*(1±jitter_ratio)`，构造参数 `jitter_ratio` 默认 0.5（实际约 0.5–1.5 倍 delay），设 0 为固定间隔。HTTP 超时由构造参数 `timeout` 控制（默认 15s）。
 - `GET /api/standard/detail/{yf001}`：仅当状态为「被代替」时调用；`a461list` 元素形如「被GB 2716-2018代替」，需正则提取标准号，再逐个查名称。
 - 响应字段：`a000` 状态原文（经 `STATUS_MAP` 转中文展示）、`a100` 标准号、`a298` 标准名、`yf001` 详情 ID。
 - 请求需带 `Origin/Referer: https://www.ndls.org.cn`，重试时轮换 User-Agent。

@@ -22,9 +22,11 @@ class WebStandardChecker(BaseStandardChecker):
   """Web版国家标准查询器"""
 
   def __init__(self, delay: float = 5.0, max_retries: int = 3, use_proxy: Optional[str] = None,
-               progress_file: str = ".web_query_progress.pkl", timeout: float = 15.0):
+               progress_file: str = ".web_query_progress.pkl", timeout: float = 15.0,
+               jitter_ratio: float = 0.5):
     super().__init__(
       delay=delay, max_retries=max_retries, use_proxy=use_proxy, timeout=timeout,
+      jitter_ratio=jitter_ratio,
     )
     self.tracker = ProgressTracker(progress_file=progress_file)
 

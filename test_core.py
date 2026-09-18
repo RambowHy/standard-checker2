@@ -184,6 +184,21 @@ class TestBaseStandardChecker(unittest.TestCase):
       wait = checker._calculate_wait_time(2)
       self.assertAlmostEqual(wait, 12.5, places=1)
 
+  def test_random_delay_bounds(self):
+    checker = BaseStandardChecker(delay=5.0, jitter_ratio=0.5)
+    with patch('core.random.uniform', return_value=-2.5):
+      self.assertAlmostEqual(checker._random_delay(), 2.5, places=4)
+    with patch('core.random.uniform', return_value=2.5):
+      self.assertAlmostEqual(checker._random_delay(), 7.5, places=4)
+    with patch('core.random.uniform', return_value=0.0):
+      self.assertAlmostEqual(checker._random_delay(), 5.0, places=4)
+
+  def test_random_delay_zero_ratio_is_fixed(self):
+    checker = BaseStandardChecker(delay=5.0, jitter_ratio=0)
+    with patch('core.random.uniform') as mock_uniform:
+      self.assertAlmostEqual(checker._random_delay(), 5.0, places=4)
+      mock_uniform.assert_not_called()
+
   def test_update_headers_rotates_ua(self):
     checker = BaseStandardChecker()
     with patch('core.random.choice', return_value=USER_AGENTS[0]):
@@ -274,6 +289,20 @@ class TestBaseStandardChecker(unittest.TestCase):
       with patch('core.time.sleep') as mock_sleep:
         checker.query_single("GB 2757-2012", sleep_after=False)
     mock_sleep.assert_not_called()
+
+  def test_success_sleep_uses_jittered_delay(self):
+    checker = BaseStandardChecker(delay=5.0, jitter_ratio=0.5)
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": "现行", "a100": "GB 2757-2012", "yf001": "y"}]},
+    }
+    with patch.object(checker.session, 'post', return_value=mock_response):
+      with patch('core.random.uniform', return_value=2.0):
+        with patch('core.time.sleep') as mock_sleep:
+          checker.query_single("GB 2757-2012", sleep_after=True)
+    mock_sleep.assert_called_once_with(7.0)
 
   def test_query_single_replaced(self):
     checker = BaseStandardChecker(delay=0)

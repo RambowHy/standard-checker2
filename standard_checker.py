@@ -222,6 +222,7 @@ def main():
   - 程序自动保存进度，中断后可重新运行继续查询
   - 进度文件保存在输入文件同目录（.progress.pkl）
   - 遇到限流会自动重试，最多3次，使用指数退避策略
+  - 实际查询间隔在 delay 基础上随机抖动（默认±50%），避免固定频率触发限流
         """
   )
 
@@ -229,6 +230,8 @@ def main():
   parser.add_argument('-f', '--file', help='Excel文件路径（将更新文件中的状态列）')
   parser.add_argument('-o', '--output', help='输出文件路径（默认覆盖原文件）')
   parser.add_argument('-d', '--delay', type=float, default=5.0, help='查询间隔（秒），默认5.0，建议3-5秒')
+  parser.add_argument('--jitter-ratio', type=float, default=0.5,
+                      help='间隔随机抖动比例，默认0.5（实际间隔为delay的0.5-1.5倍），设0为固定间隔')
   parser.add_argument('--clear-progress', action='store_true', help='清除进度重新开始')
   parser.add_argument('--proxy', help='代理地址，如 http://127.0.0.1:7890')
   parser.add_argument('--no-resume', action='store_true', help='禁用断点续传（默认启用）')
@@ -239,7 +242,9 @@ def main():
     parser.print_help()
     sys.exit(0)
 
-  checker = StandardChecker(delay=args.delay, use_proxy=args.proxy)
+  checker = StandardChecker(
+    delay=args.delay, use_proxy=args.proxy, jitter_ratio=args.jitter_ratio,
+  )
 
   if args.file:
     checker.update_excel(

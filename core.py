@@ -162,11 +162,13 @@ class BaseStandardChecker:
   """国家标准查询器基类"""
 
   def __init__(self, delay: float = 5.0, max_retries: int = 3,
-               use_proxy: Optional[str] = None, timeout: float = 15.0):
+               use_proxy: Optional[str] = None, timeout: float = 15.0,
+               jitter_ratio: float = 0.5):
     self.delay = delay
     self.max_retries = max_retries
     self.use_proxy = use_proxy
     self.timeout = timeout
+    self.jitter_ratio = jitter_ratio
     self.session = requests.Session()
     self.stats = QueryStats()
     self._update_headers()
@@ -193,6 +195,13 @@ class BaseStandardChecker:
     base_wait = self.delay * (2 ** retry_count)
     jitter = random.uniform(0, 1)
     return base_wait + jitter
+
+  def _random_delay(self) -> float:
+    """以 delay 为均值的随机间隔，范围 delay*(1±jitter_ratio)；ratio=0 时为固定间隔"""
+    if self.jitter_ratio <= 0:
+      return self.delay
+    span = self.delay * self.jitter_ratio
+    return self.delay + random.uniform(-span, span)
 
   @staticmethod
   def _parse_replacement_nos(raw_list: List[str]) -> List[str]:
@@ -221,7 +230,7 @@ class BaseStandardChecker:
       for replacement_no in replacement_nos:
         name = self._fetch_standard_name(replacement_no)
         replacements.append(ReplacementStandard(标准号=replacement_no, 标准名=name))
-        time.sleep(self.delay * 0.5)
+        time.sleep(self._random_delay() * 0.5)
 
       return replacements
 
@@ -311,7 +320,7 @@ class BaseStandardChecker:
 
         self.stats.success += 1
         if sleep_after:
-          time.sleep(self.delay)
+          time.sleep(self._random_delay())
         return StandardResult(
           标准号=standard_no,
           状态=friendly_status,
