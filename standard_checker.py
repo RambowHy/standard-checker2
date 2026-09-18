@@ -9,12 +9,20 @@
 
 import argparse
 import logging
+import os
 import sys
+import tempfile
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 
-from core import BaseStandardChecker, ProgressTracker, StandardResult, logger
+from core import (
+  BaseStandardChecker,
+  ProgressTracker,
+  normalize_standard_nos,
+  logger,
+)
 
 FORMAT = "%(message)s"
 
@@ -43,6 +51,7 @@ class StandardChecker(BaseStandardChecker):
       查询结果列表（StandardResult）
     """
     results: list = []
+    standard_nos = normalize_standard_nos(standard_nos)
     total = len(standard_nos)
     self.stats.reset()
     self.stats.start_time = _now()
@@ -56,6 +65,8 @@ class StandardChecker(BaseStandardChecker):
 
     if not pending_nos:
       logger.info("[完成] 所有标准已查询完毕")
+      if tracker:
+        return [tracker.get_result(s) for s in standard_nos if tracker.is_completed(s)]
       return []
 
     logger.info("\n开始查询 %d 个标准...", len(pending_nos))
@@ -70,25 +81,26 @@ class StandardChecker(BaseStandardChecker):
 
       logger.info("[%3d/%d] [%-25s] ETA: %s", i, len(pending_nos), standard_no, eta_str)
 
-      result = self.query_single(standard_no)
+      result = self.query_single(standard_no, sleep_after=(i < len(pending_nos)))
 
       if result.错误:
         logger.info("=> 错误: %s", result.错误)
-        if tracker:
-          tracker.mark_failed(standard_no, result.错误)
       else:
         if result.替代标准:
           logger.info("=> %s (替代: %s)", result.状态, result.替代标准号)
         else:
           logger.info("=> %s", result.状态)
         if tracker:
-          tracker.mark_completed(standard_no)
+          tracker.mark_completed(standard_no, result)
 
-      results.append(result)
+      if not tracker:
+        results.append(result)
 
     logger.info("-" * 100)
     self._print_stats(len(pending_nos))
 
+    if tracker:
+      return [tracker.get_result(s) for s in standard_nos if tracker.is_completed(s)]
     return results
 
   def update_excel(self, input_file: str, output_file: str = None,
@@ -120,20 +132,26 @@ class StandardChecker(BaseStandardChecker):
         if col not in df.columns:
           df[col] = ''
 
-      standard_nos = df['标准号'].dropna().astype(str).tolist()
+      raw_nos = df['标准号'].dropna().astype(str).tolist()
+      standard_nos = normalize_standard_nos(raw_nos)
+      df['标准号'] = df['标准号'].dropna().astype(str).map(str.strip)
       results = self.query_batch(standard_nos, tracker=tracker, resume=resume)
 
       now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-      for result in results:
-        mask = df['标准号'] == result.标准号
-        if mask.any():
-          idx = df[mask].index[0]
-          df.at[idx, 'ndls状态'] = result.错误 or result.状态 or ""
-          df.at[idx, 'ndls查询时间'] = now_str
-          df.at[idx, '替代标准号'] = result.替代标准号
-          df.at[idx, '替代标准名'] = result.替代标准名
+      result_map = {r.标准号: r for r in results}
+      mask = df['标准号'].isin(result_map.keys())
+      for idx in df[mask].index:
+        result = result_map[df.at[idx, '标准号']]
+        df.at[idx, 'ndls状态'] = result.错误 or result.状态 or ""
+        df.at[idx, 'ndls查询时间'] = now_str
+        df.at[idx, '替代标准号'] = result.替代标准号
+        df.at[idx, '替代标准名'] = result.替代标准名
 
-      df.to_excel(output_file, index=False)
+      output_dir = os.path.dirname(os.path.abspath(output_file))
+      fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=output_dir)
+      os.close(fd)
+      df.to_excel(tmp_path, index=False)
+      os.replace(tmp_path, output_file)
       logger.info("\n结果已保存: %s", output_file)
 
       logger.info("\n状态统计:")
@@ -143,12 +161,12 @@ class StandardChecker(BaseStandardChecker):
       if replaced_count > 0:
         logger.info("\n发现 %d 个有替代标准的记录", replaced_count)
 
-      if len(tracker.completed) == len(standard_nos):
+      if tracker.completed_count() == len(standard_nos):
         tracker.clear()
         logger.info("\n[完成] 所有数据查询完毕，进度文件已清理")
       else:
         logger.info("\n[提示] 还有 %d 条未查询，可重新运行继续",
-                     len(standard_nos) - len(tracker.completed))
+                     len(standard_nos) - tracker.completed_count())
 
     except FileNotFoundError:
       logger.error("错误: 找不到文件 '%s'", input_file)
@@ -171,7 +189,6 @@ class StandardChecker(BaseStandardChecker):
 
 
 def _now() -> float:
-  import time
   return time.time()
 
 

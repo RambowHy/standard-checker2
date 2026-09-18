@@ -40,7 +40,7 @@ STATUS_MAP = {
   "未生效": "未生效"
 }
 
-PROGRESS_VERSION = 1
+PROGRESS_VERSION = 2
 
 
 @dataclass
@@ -66,15 +66,6 @@ class StandardResult:
   def 替代标准名(self) -> str:
     return ", ".join(r.标准名 for r in self.替代标准)
 
-  def to_dict(self) -> dict:
-    """转为兼容字典格式"""
-    return {
-      "标准号": self.标准号,
-      "状态": self.错误 or self.状态 or "",
-      "替代标准": self.替代标准号,
-      "替代列表": [{"标准号": r.标准号, "标准名": r.标准名} for r in self.替代标准],
-    }
-
 
 @dataclass
 class QueryStats:
@@ -91,14 +82,31 @@ class QueryStats:
     self.start_time = None
 
 
+def normalize_standard_nos(raw_nos: List[str]) -> List[str]:
+  """去空白并按首次出现顺序去重，丢弃空值"""
+  normalized = []
+  seen = set()
+  for raw in raw_nos:
+    if raw is None:
+      continue
+    standard_no = str(raw).strip()
+    if standard_no and standard_no not in seen:
+      seen.add(standard_no)
+      normalized.append(standard_no)
+  return normalized
+
+
 class ProgressTracker:
-  """进度跟踪器 - 支持断点续传"""
+  """进度跟踪器 - 支持断点续传，持久化已完成条目的查询结果"""
 
   def __init__(self, progress_file: str = ".query_progress.pkl"):
     self.progress_file = progress_file
-    self.completed: set = set()
-    self.failed: dict = {}
+    self.results: dict = {}
     self.load()
+
+  @property
+  def completed(self) -> set:
+    return set(self.results.keys())
 
   def load(self):
     if not os.path.exists(self.progress_file):
@@ -111,40 +119,37 @@ class ProgressTracker:
         logger.warning("进度文件版本不兼容，将忽略已有进度")
         self._remove_file()
         return
-      self.completed = data.get('completed', set())
-      self.failed = data.get('failed', {})
-      logger.info("已加载进度: %d 条已完成, %d 条失败", len(self.completed), len(self.failed))
+      self.results = data.get('results', {})
+      logger.info("已加载进度: %d 条已完成", len(self.results))
     except Exception as e:
       logger.warning("加载进度文件失败: %s", e)
-      self.completed = set()
-      self.failed = {}
+      self.results = {}
 
   def save(self):
     try:
       with open(self.progress_file, 'wb') as f:
         pickle.dump({
           'version': PROGRESS_VERSION,
-          'completed': self.completed,
-          'failed': self.failed,
+          'results': self.results,
         }, f)
     except Exception as e:
       logger.warning("保存进度文件失败: %s", e)
 
-  def mark_completed(self, standard_no: str):
-    self.completed.add(standard_no)
-    self.failed.pop(standard_no, None)
+  def mark_completed(self, standard_no: str, result: StandardResult):
+    self.results[standard_no] = result
     self.save()
 
-  def mark_failed(self, standard_no: str, error: str):
-    self.failed[standard_no] = error
-    self.save()
+  def get_result(self, standard_no: str) -> Optional[StandardResult]:
+    return self.results.get(standard_no)
 
   def is_completed(self, standard_no: str) -> bool:
-    return standard_no in self.completed
+    return standard_no in self.results
+
+  def completed_count(self) -> int:
+    return len(self.results)
 
   def clear(self):
-    self.completed = set()
-    self.failed = {}
+    self.results = {}
     self._remove_file()
     logger.info("已清除所有进度")
 
@@ -156,10 +161,12 @@ class ProgressTracker:
 class BaseStandardChecker:
   """国家标准查询器基类"""
 
-  def __init__(self, delay: float = 5.0, max_retries: int = 3, use_proxy: Optional[str] = None):
+  def __init__(self, delay: float = 5.0, max_retries: int = 3,
+               use_proxy: Optional[str] = None, timeout: float = 15.0):
     self.delay = delay
     self.max_retries = max_retries
     self.use_proxy = use_proxy
+    self.timeout = timeout
     self.session = requests.Session()
     self.stats = QueryStats()
     self._update_headers()
@@ -199,7 +206,7 @@ class BaseStandardChecker:
   def _get_replacements(self, yf001: str) -> List[ReplacementStandard]:
     """获取替代标准列表"""
     try:
-      response = self.session.get(f"{DETAIL_URL}/{yf001}", timeout=15)
+      response = self.session.get(f"{DETAIL_URL}/{yf001}", timeout=self.timeout)
       if response.status_code != 200:
         return []
 
@@ -225,7 +232,7 @@ class BaseStandardChecker:
     """查询标准名称"""
     data = {"a100": standard_no, "page": 1, "limit": 10}
     try:
-      resp = self.session.post(API_URL, json=data, timeout=15)
+      resp = self.session.post(API_URL, json=data, timeout=self.timeout)
       if resp.status_code == 200:
         res = resp.json()
         if res.get("code") == 0:
@@ -236,12 +243,13 @@ class BaseStandardChecker:
       pass
     return ""
 
-  def query_single(self, standard_no: str) -> StandardResult:
+  def query_single(self, standard_no: str, sleep_after: bool = True) -> StandardResult:
     """
     查询单个标准
 
     Args:
       standard_no: 标准号，如 "GB 2757-2012"
+      sleep_after: 查询成功后是否按 delay 等待（批量查询时最后一条传 False）
 
     Returns:
       StandardResult
@@ -255,15 +263,17 @@ class BaseStandardChecker:
           self._update_headers()
 
         data = {"a100": standard_no, "page": 1, "limit": 10}
-        response = self.session.post(API_URL, json=data, timeout=15)
+        response = self.session.post(API_URL, json=data, timeout=self.timeout)
 
         if response.status_code != 200:
           last_error = f"HTTP错误 {response.status_code}"
-          retry_count += 1
-          if retry_count <= self.max_retries:
-            wait_time = self._calculate_wait_time(retry_count)
-            time.sleep(wait_time)
-            continue
+          if response.status_code == 429 or response.status_code >= 500:
+            self.stats.rate_limited += 1
+            retry_count += 1
+            if retry_count <= self.max_retries:
+              wait_time = self._calculate_wait_time(retry_count)
+              time.sleep(wait_time)
+              continue
           self.stats.failed += 1
           return StandardResult(标准号=standard_no, 错误=last_error)
 
@@ -300,7 +310,8 @@ class BaseStandardChecker:
           replacement_list = self._get_replacements(yf001)
 
         self.stats.success += 1
-        time.sleep(self.delay)
+        if sleep_after:
+          time.sleep(self.delay)
         return StandardResult(
           标准号=standard_no,
           状态=friendly_status,

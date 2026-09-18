@@ -22,6 +22,7 @@ from core import (
   StandardResult,
   STATUS_MAP,
   USER_AGENTS,
+  normalize_standard_nos,
 )
 
 
@@ -34,6 +35,16 @@ class TestReplacementStandard(unittest.TestCase):
   def test_default_name(self):
     r = ReplacementStandard(标准号="GB/T 8170-2008")
     self.assertEqual(r.标准名, "")
+
+
+class TestNormalizeStandardNos(unittest.TestCase):
+  def test_strip_and_dedupe_keep_order(self):
+    result = normalize_standard_nos([" GB 1 ", "GB 1", "", "  ", "GB 2", None, "GB 2 "])
+    self.assertEqual(result, ["GB 1", "GB 2"])
+
+  def test_empty(self):
+    self.assertEqual(normalize_standard_nos([]), [])
+    self.assertEqual(normalize_standard_nos([None, "  "]), [])
 
 
 class TestStandardResult(unittest.TestCase):
@@ -61,24 +72,7 @@ class TestStandardResult(unittest.TestCase):
     self.assertEqual(r.状态, None)
     self.assertEqual(r.错误, "未找到")
 
-  def test_to_dict(self):
-    r = StandardResult(
-      标准号="GB 2757-2012",
-      状态="已被代替",
-      替代标准=[ReplacementStandard(标准号="GB 2716-2018", 标准名="植物油")],
-    )
-    d = r.to_dict()
-    self.assertEqual(d["标准号"], "GB 2757-2012")
-    self.assertEqual(d["状态"], "已被代替")
-    self.assertEqual(d["替代标准"], "GB 2716-2018")
-    self.assertEqual(len(d["替代列表"]), 1)
-    self.assertEqual(d["替代列表"][0]["标准号"], "GB 2716-2018")
-    self.assertEqual(d["替代列表"][0]["标准名"], "植物油")
 
-  def test_to_dict_error(self):
-    r = StandardResult(标准号="GB 9999-9999", 错误="未找到")
-    d = r.to_dict()
-    self.assertEqual(d["状态"], "未找到")
 
 
 class TestQueryStats(unittest.TestCase):
@@ -110,56 +104,59 @@ class TestProgressTracker(unittest.TestCase):
 
   def test_new_tracker(self):
     tracker = ProgressTracker(self.progress_file)
+    self.assertEqual(tracker.completed_count(), 0)
     self.assertEqual(len(tracker.completed), 0)
-    self.assertEqual(len(tracker.failed), 0)
 
   def test_mark_completed(self):
     tracker = ProgressTracker(self.progress_file)
-    tracker.mark_completed("GB 2757-2012")
+    tracker.mark_completed("GB 2757-2012", StandardResult(标准号="GB 2757-2012", 状态="现行有效"))
     self.assertTrue(tracker.is_completed("GB 2757-2012"))
     self.assertFalse(tracker.is_completed("GB/T 8170-2008"))
+    self.assertEqual(tracker.completed_count(), 1)
 
-  def test_mark_failed(self):
+  def test_get_stored_result(self):
     tracker = ProgressTracker(self.progress_file)
-    tracker.mark_failed("GB 9999-9999", "未找到")
+    result = StandardResult(标准号="GB 2757-2012", 状态="现行有效")
+    tracker.mark_completed("GB 2757-2012", result)
+    self.assertEqual(tracker.get_result("GB 2757-2012").状态, "现行有效")
+    self.assertIsNone(tracker.get_result("GB/T 8170-2008"))
+
+  def test_failed_not_persisted(self):
+    # 失败条目不标记完成，下次运行仍会重新查询
+    tracker = ProgressTracker(self.progress_file)
+    tracker.mark_completed("GB 2757-2012", StandardResult(标准号="GB 2757-2012", 状态="现行有效"))
+    self.assertTrue(tracker.is_completed("GB 2757-2012"))
     self.assertFalse(tracker.is_completed("GB 9999-9999"))
-    self.assertEqual(tracker.failed["GB 9999-9999"], "未找到")
-
-  def test_mark_completed_removes_failed(self):
-    tracker = ProgressTracker(self.progress_file)
-    tracker.mark_failed("GB 2757-2012", "超时")
-    self.assertIn("GB 2757-2012", tracker.failed)
-    tracker.mark_completed("GB 2757-2012")
-    self.assertNotIn("GB 2757-2012", tracker.failed)
+    self.assertEqual(tracker.completed_count(), 1)
 
   def test_persistence(self):
     tracker1 = ProgressTracker(self.progress_file)
-    tracker1.mark_completed("GB 2757-2012")
-    tracker1.mark_failed("GB 9999-9999", "未找到")
+    tracker1.mark_completed("GB 2757-2012", StandardResult(标准号="GB 2757-2012", 状态="现行有效"))
     del tracker1
 
     tracker2 = ProgressTracker(self.progress_file)
     self.assertTrue(tracker2.is_completed("GB 2757-2012"))
-    self.assertEqual(tracker2.failed.get("GB 9999-9999"), "未找到")
+    self.assertEqual(tracker2.get_result("GB 2757-2012").状态, "现行有效")
+    self.assertFalse(tracker2.is_completed("GB 9999-9999"))
 
   def test_clear(self):
     tracker = ProgressTracker(self.progress_file)
-    tracker.mark_completed("GB 2757-2012")
+    tracker.mark_completed("GB 2757-2012", StandardResult(标准号="GB 2757-2012", 状态="现行有效"))
     tracker.clear()
-    self.assertEqual(len(tracker.completed), 0)
+    self.assertEqual(tracker.completed_count(), 0)
     self.assertFalse(os.path.exists(self.progress_file))
 
   def test_version_incompatible(self):
     with open(self.progress_file, 'wb') as f:
-      pickle.dump({'version': 999, 'completed': {'GB 2757-2012'}, 'failed': {}}, f)
+      pickle.dump({'version': 999, 'results': {'GB 2757-2012': None}}, f)
     tracker = ProgressTracker(self.progress_file)
-    self.assertEqual(len(tracker.completed), 0)
+    self.assertEqual(tracker.completed_count(), 0)
 
   def test_corrupt_file(self):
     with open(self.progress_file, 'wb') as f:
       f.write(b"not valid pickle data")
     tracker = ProgressTracker(self.progress_file)
-    self.assertEqual(len(tracker.completed), 0)
+    self.assertEqual(tracker.completed_count(), 0)
 
 
 class TestBaseStandardChecker(unittest.TestCase):
@@ -237,6 +234,47 @@ class TestBaseStandardChecker(unittest.TestCase):
         result = checker.query_single("GB 2757-2012")
     self.assertIn("HTTP错误", result.错误)
 
+  def test_4xx_no_retry(self):
+    # 400/404 等客户端错误不应重试
+    checker = BaseStandardChecker(delay=3.0, max_retries=5)
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+    with patch.object(checker.session, 'post', return_value=mock_response) as mock_post:
+      with patch('core.time.sleep') as mock_sleep:
+        result = checker.query_single("GB 2757-2012")
+    self.assertIn("HTTP错误 404", result.错误)
+    self.assertEqual(mock_post.call_count, 1)
+    mock_sleep.assert_not_called()
+
+  def test_429_retries(self):
+    checker = BaseStandardChecker(delay=0, max_retries=2)
+    rate_limited = MagicMock()
+    rate_limited.status_code = 429
+    ok_response = MagicMock()
+    ok_response.status_code = 200
+    ok_response.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": "现行", "a100": "GB 2757-2012", "yf001": "y"}]},
+    }
+    with patch.object(checker.session, 'post', side_effect=[rate_limited, ok_response]):
+      with patch('core.time.sleep'):
+        result = checker.query_single("GB 2757-2012", sleep_after=False)
+    self.assertEqual(result.状态, "现行有效")
+    self.assertGreaterEqual(checker.stats.rate_limited, 1)
+
+  def test_no_sleep_after_last_when_disabled(self):
+    checker = BaseStandardChecker(delay=5.0)
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": "现行", "a100": "GB 2757-2012", "yf001": "y"}]},
+    }
+    with patch.object(checker.session, 'post', return_value=mock_response):
+      with patch('core.time.sleep') as mock_sleep:
+        checker.query_single("GB 2757-2012", sleep_after=False)
+    mock_sleep.assert_not_called()
+
   def test_query_single_replaced(self):
     checker = BaseStandardChecker(delay=0)
     mock_list_response = MagicMock()
@@ -304,10 +342,128 @@ class TestCLIQuery(unittest.TestCase):
     self.assertEqual(results[0].状态, "现行有效")
 
 
+class TestResume(unittest.TestCase):
+  """断点续跑：已完成条目的结果必须从进度记录恢复，不能丢失"""
+
+  def setUp(self):
+    self.tmpdir = tempfile.mkdtemp()
+    self.progress_file = os.path.join(self.tmpdir, "test_progress.pkl")
+
+  def tearDown(self):
+    for name in os.listdir(self.tmpdir):
+      os.remove(os.path.join(self.tmpdir, name))
+    os.rmdir(self.tmpdir)
+
+  def _mock_response(self, status: str):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": status, "a100": "x", "yf001": "y"}]},
+    }
+    return mock_response
+
+  def test_query_batch_resume_merges_history(self):
+    from standard_checker import StandardChecker
+    all_nos = ["GB 2757-2012", "GB/T 8170-2008"]
+    queried = []
+
+    def post_side_effect(url, json=None, timeout=None):
+      queried.append(json["a100"])
+      status = "现行" if json["a100"] == "GB 2757-2012" else "废止"
+      return self._mock_response(status)
+
+    # 第一轮：只查第一个标准（模拟中断）
+    checker1 = StandardChecker(delay=0)
+    tracker1 = ProgressTracker(self.progress_file)
+    with patch.object(checker1.session, 'post', side_effect=post_side_effect):
+      with patch('core.time.sleep'):
+        results1 = checker1.query_batch([all_nos[0]], tracker=tracker1)
+    self.assertEqual([r.标准号 for r in results1], [all_nos[0]])
+
+    # 第二轮：传入完整列表，已完成的应跳过且结果被带回
+    checker2 = StandardChecker(delay=0)
+    tracker2 = ProgressTracker(self.progress_file)
+    with patch.object(checker2.session, 'post', side_effect=post_side_effect):
+      with patch('core.time.sleep'):
+        results2 = checker2.query_batch(all_nos, tracker=tracker2)
+
+    self.assertEqual(queried, all_nos)
+    self.assertEqual([r.标准号 for r in results2], all_nos)
+    self.assertEqual(results2[0].状态, "现行有效")
+    self.assertEqual(results2[1].状态, "已废止")
+
+  def test_update_excel_resume_fills_all_rows(self):
+    from standard_checker import StandardChecker
+    input_file = os.path.join(self.tmpdir, "resume_input.xlsx")
+    output_file = os.path.join(self.tmpdir, "resume_output.xlsx")
+
+    import pandas as pd
+    pd.DataFrame({"标准号": ["GB 2757-2012", "GB/T 8170-2008"]}).to_excel(input_file, index=False)
+
+    def ok_response(no: str, status: str):
+      mock_response = MagicMock()
+      mock_response.status_code = 200
+      mock_response.json.return_value = {
+        "code": 0,
+        "data": {"results": [{"a000": status, "a100": no, "yf001": "y"}]},
+      }
+      return mock_response
+
+    def not_found_response():
+      mock_response = MagicMock()
+      mock_response.status_code = 200
+      mock_response.json.return_value = {"code": 0, "data": {"results": []}}
+      return mock_response
+
+    # 第一轮：第二条「未找到」，第一条成功并留存进度
+    def first_round(url, json=None, timeout=None):
+      if json["a100"] == "GB 2757-2012":
+        return ok_response("GB 2757-2012", "现行")
+      return not_found_response()
+
+    checker1 = StandardChecker(delay=0, max_retries=0)
+    with patch.object(checker1.session, 'post', side_effect=first_round):
+      with patch('core.time.sleep'):
+        checker1.update_excel(input_file, output_file)
+
+    self.assertTrue(os.path.exists(input_file + ".progress.pkl"))
+
+    # 第二轮：第二条恢复正常，续跑后两行都必须有状态（含第一轮的历史结果）
+    def second_round(url, json=None, timeout=None):
+      status = "现行" if json["a100"] == "GB 2757-2012" else "废止"
+      return ok_response(json["a100"], status)
+
+    queried = []
+
+    def tracking_post(url, json=None, timeout=None):
+      queried.append(json["a100"])
+      return second_round(url, json=json, timeout=timeout)
+
+    checker2 = StandardChecker(delay=0, max_retries=0)
+    with patch.object(checker2.session, 'post', side_effect=tracking_post):
+      with patch('core.time.sleep'):
+        checker2.update_excel(input_file, output_file)
+
+    self.assertEqual(queried, ["GB/T 8170-2008"])
+    result_df = pd.read_excel(output_file)
+    self.assertEqual(result_df['ndls状态'].tolist(), ["现行有效", "已废止"])
+    self.assertFalse(os.path.exists(input_file + ".progress.pkl"))
+
+
 class TestWebChecker(unittest.TestCase):
+  def setUp(self):
+    self.tmpdir = tempfile.mkdtemp()
+    self.progress_file = os.path.join(self.tmpdir, "web_progress.pkl")
+
+  def tearDown(self):
+    for name in os.listdir(self.tmpdir):
+      os.remove(os.path.join(self.tmpdir, name))
+    os.rmdir(self.tmpdir)
+
   def test_batch_with_callback(self):
     from web_checker import WebStandardChecker
-    checker = WebStandardChecker(delay=0)
+    checker = WebStandardChecker(delay=0, progress_file=self.progress_file)
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
@@ -336,6 +492,47 @@ class TestWebChecker(unittest.TestCase):
     self.assertEqual(len(progress_calls), 1)
     self.assertTrue(len(log_calls) >= 1)
 
+  def test_cancelled_returns_only_completed(self):
+    from web_checker import WebStandardChecker
+    checker = WebStandardChecker(delay=0, progress_file=self.progress_file)
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": "现行", "a100": "x", "yf001": "y"}]},
+    }
+    with patch.object(checker.session, 'post', return_value=mock_response):
+      with patch('core.time.sleep'):
+        results = checker.query_batch_with_callback(
+          ["GB 2757-2012", "GB/T 8170-2008"],
+          should_stop=lambda: True,
+        )
+    self.assertEqual(results, [])
+    self.assertEqual(checker.tracker.completed_count(), 0)
+
+  def test_normalize_and_dedupe(self):
+    from web_checker import WebStandardChecker
+    checker = WebStandardChecker(delay=0, progress_file=self.progress_file)
+    queried = []
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": "现行", "a100": "x", "yf001": "y"}]},
+    }
+
+    def post_side_effect(url, json=None, timeout=None):
+      queried.append(json["a100"])
+      return mock_response
+
+    with patch.object(checker.session, 'post', side_effect=post_side_effect):
+      with patch('core.time.sleep'):
+        results = checker.query_batch_with_callback(
+          [" GB 1 ", "GB 1", "", "GB 2"],
+        )
+    self.assertEqual(queried, ["GB 1", "GB 2"])
+    self.assertEqual([r.标准号 for r in results], ["GB 1", "GB 2"])
+
 
 class TestExcelUpdate(unittest.TestCase):
   def setUp(self):
@@ -348,9 +545,8 @@ class TestExcelUpdate(unittest.TestCase):
     df.to_excel(self.input_file, index=False)
 
   def tearDown(self):
-    for f in [self.input_file, self.output_file, self.input_file + ".progress.pkl"]:
-      if os.path.exists(f):
-        os.remove(f)
+    for name in os.listdir(self.tmpdir):
+      os.remove(os.path.join(self.tmpdir, name))
     os.rmdir(self.tmpdir)
 
   def test_update_excel(self):
@@ -379,6 +575,35 @@ class TestExcelUpdate(unittest.TestCase):
     self.assertIn('ndls查询时间', result_df.columns)
     self.assertIn('替代标准号', result_df.columns)
     self.assertIn('替代标准名', result_df.columns)
+
+  def test_duplicate_and_whitespace_rows_all_filled(self):
+    from standard_checker import StandardChecker
+    dup_input = os.path.join(self.tmpdir, "dup_input.xlsx")
+    dup_output = os.path.join(self.tmpdir, "dup_output.xlsx")
+
+    import pandas as pd
+    pd.DataFrame({"标准号": [" GB 1 ", "GB 1", "GB 2"]}).to_excel(dup_input, index=False)
+
+    checker = StandardChecker(delay=0, max_retries=0)
+
+    def post_side_effect(url, json=None, timeout=None):
+      status = "现行" if json["a100"] == "GB 1" else "废止"
+      mock_response = MagicMock()
+      mock_response.status_code = 200
+      mock_response.json.return_value = {
+        "code": 0,
+        "data": {"results": [{"a000": status, "a100": json["a100"], "yf001": "y"}]},
+      }
+      return mock_response
+
+    with patch.object(checker.session, 'post', side_effect=post_side_effect):
+      with patch('core.time.sleep'):
+        checker.update_excel(dup_input, dup_output)
+
+    result_df = pd.read_excel(dup_output)
+    self.assertEqual(result_df['标准号'].tolist(), ["GB 1", "GB 1", "GB 2"])
+    self.assertEqual(result_df['ndls状态'].tolist(), ["现行有效", "现行有效", "已废止"])
+    self.assertFalse(os.path.exists(dup_input + ".progress.pkl"))
 
 
 class TestModuleImports(unittest.TestCase):
