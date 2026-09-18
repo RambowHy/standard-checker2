@@ -62,13 +62,13 @@ def main():
 
     delay = st.slider(
       "查询间隔（秒）",
-      min_value=1.0, max_value=10.0, value=3.0, step=0.5,
+      min_value=1.0, max_value=10.0, value=5.0, step=0.5,
       help="每次查询之间的间隔时间，建议3-5秒以避免触发限流",
     )
 
     max_retries = st.slider(
       "最大重试次数",
-      min_value=1, max_value=10, value=5, step=1,
+      min_value=1, max_value=10, value=3, step=1,
       help="查询失败时的最大重试次数",
     )
 

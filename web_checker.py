@@ -15,7 +15,7 @@ from core import BaseStandardChecker, ProgressTracker, StandardResult, logger
 class WebStandardChecker(BaseStandardChecker):
   """Web版国家标准查询器"""
 
-  def __init__(self, delay: float = 3.0, max_retries: int = 5, use_proxy: Optional[str] = None):
+  def __init__(self, delay: float = 5.0, max_retries: int = 3, use_proxy: Optional[str] = None):
     super().__init__(delay=delay, max_retries=max_retries, use_proxy=use_proxy)
     self.tracker = ProgressTracker(progress_file=".web_query_progress.pkl")
 

@@ -26,8 +26,8 @@ python standard_checker.py -s "GB 2757-2012"
 # 批量查询（空格分隔）
 python standard_checker.py -s "GB 2757-2012" "GB/T 8170-2008"
 
-# 更新 Excel 文件（默认覆盖原文件，建议间隔 3-5 秒）
-python standard_checker.py -f input.xlsx -d 3.0
+# 更新 Excel 文件（默认覆盖原文件，默认间隔 5 秒）
+python standard_checker.py -f input.xlsx -d 5.0
 
 # 输出到新文件
 python standard_checker.py -f input.xlsx -o output.xlsx
@@ -46,7 +46,7 @@ python standard_checker.py -f input.xlsx --proxy http://127.0.0.1:7890
 | `-s, --standards` | 要查询的标准号，空格分隔 |
 | `-f, --file` | 待更新的 Excel 文件 |
 | `-o, --output` | 输出文件路径，默认覆盖原文件 |
-| `-d, --delay` | 查询间隔（秒），默认 3.0，建议 3-5 |
+| `-d, --delay` | 查询间隔（秒），默认 5.0，建议 3-5 |
 | `--proxy` | 代理地址 |
 | `--clear-progress` | 清除进度后重新开始 |
 | `--no-resume` | 禁用断点续传（默认启用） |
@@ -96,7 +96,7 @@ streamlit run web_app.py
 
 ## 限流与重试
 
-查询间隔建议保持 3-5 秒。接口返回限流或验证码提示时，按 `间隔 × 2^重试次数 + 随机抖动` 指数退避，默认最多重试 5 次。
+查询间隔默认 5 秒（建议 3-5 秒）。接口返回限流或验证码提示时，按 `间隔 × 2^重试次数 + 随机抖动` 指数退避，默认最多重试 3 次。
 
 ## 项目结构
 

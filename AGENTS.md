@@ -22,7 +22,7 @@ python -m unittest test_core.TestBaseStandardChecker.test_query_single_success  
 
 # CLI
 python standard_checker.py -s "GB 2757-2012"                       # 单个/多个（空格分隔）
-python standard_checker.py -f input.xlsx -d 3.0                    # 更新 Excel，默认覆盖原文件
+python standard_checker.py -f input.xlsx -d 5.0                    # 更新 Excel，默认覆盖原文件
 python standard_checker.py -f input.xlsx -o out.xlsx --clear-progress
 python standard_checker.py -f input.xlsx --proxy http://127.0.0.1:7890
 
@@ -51,7 +51,7 @@ python standard_checker.py -f input.xlsx --proxy http://127.0.0.1:7890
 
 ## ndls.org.cn API 契约
 
-- `POST /api/standard/list`，body `{"a100": 标准号, "page": 1, "limit": 10}`；`code != 0` 且 message 含「限流」或「验证码」时按指数退避（`delay * 2**retry_count + 随机抖动`）重试，默认间隔 3s、最多 5 次；其他错误不重试。
+- `POST /api/standard/list`，body `{"a100": 标准号, "page": 1, "limit": 10}`；`code != 0` 且 message 含「限流」或「验证码」时按指数退避（`delay * 2**retry_count + 随机抖动`）重试，默认间隔 5s、最多 3 次；其他错误不重试。
 - `GET /api/standard/detail/{yf001}`：仅当状态为「被代替」时调用；`a461list` 元素形如「被GB 2716-2018代替」，需正则提取标准号，再逐个查名称。
 - 响应字段：`a000` 状态原文（经 `STATUS_MAP` 转中文展示）、`a100` 标准号、`a298` 标准名、`yf001` 详情 ID。
 - 请求需带 `Origin/Referer: https://www.ndls.org.cn`，重试时轮换 User-Agent。

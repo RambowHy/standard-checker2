@@ -156,7 +156,7 @@ class ProgressTracker:
 class BaseStandardChecker:
   """国家标准查询器基类"""
 
-  def __init__(self, delay: float = 3.0, max_retries: int = 5, use_proxy: Optional[str] = None):
+  def __init__(self, delay: float = 5.0, max_retries: int = 3, use_proxy: Optional[str] = None):
     self.delay = delay
     self.max_retries = max_retries
     self.use_proxy = use_proxy

@@ -186,11 +186,11 @@ def main():
   # 查询单个标准
   python standard_checker.py -s "GB 2757-2012"
 
-  # 批量查询（默认间隔3秒）
+  # 批量查询（默认间隔5秒）
   python standard_checker.py -s "GB 2757-2012" "GB/T 8170-2008"
 
   # 更新Excel文件（推荐间隔3-5秒）
-  python standard_checker.py -f standards.xlsx -d 3.0
+  python standard_checker.py -f standards.xlsx -d 5.0
 
   # 清除进度重新开始
   python standard_checker.py -f standards.xlsx --clear-progress
@@ -204,14 +204,14 @@ def main():
 说明:
   - 程序自动保存进度，中断后可重新运行继续查询
   - 进度文件保存在输入文件同目录（.progress.pkl）
-  - 遇到限流会自动重试，最多5次，使用指数退避策略
+  - 遇到限流会自动重试，最多3次，使用指数退避策略
         """
   )
 
   parser.add_argument('-s', '--standards', nargs='+', help='要查询的标准号列表（空格分隔）')
   parser.add_argument('-f', '--file', help='Excel文件路径（将更新文件中的状态列）')
   parser.add_argument('-o', '--output', help='输出文件路径（默认覆盖原文件）')
-  parser.add_argument('-d', '--delay', type=float, default=3.0, help='查询间隔（秒），默认3.0，建议3-5秒')
+  parser.add_argument('-d', '--delay', type=float, default=5.0, help='查询间隔（秒），默认5.0，建议3-5秒')
   parser.add_argument('--clear-progress', action='store_true', help='清除进度重新开始')
   parser.add_argument('--proxy', help='代理地址，如 http://127.0.0.1:7890')
   parser.add_argument('--no-resume', action='store_true', help='禁用断点续传（默认启用）')
