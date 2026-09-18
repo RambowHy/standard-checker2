@@ -341,6 +341,62 @@ class TestBaseStandardChecker(unittest.TestCase):
     self.assertEqual(len(result.替代标准), 1)
     self.assertEqual(result.替代标准[0].标准号, "GB 2716-2018")
 
+  def test_query_single_abolished_with_plain_replacement_no(self):
+    # 作废状态也可能在详情中返回纯标准号（无"被X代替"前缀），应识别为替代标准
+    checker = BaseStandardChecker(delay=0)
+    mock_list_response = MagicMock()
+    mock_list_response.status_code = 200
+    mock_list_response.json.return_value = {
+      "code": 0,
+      "data": {
+        "results": [{
+          "a000": "作废",
+          "a100": "GB/T 31114-2014",
+          "yf001": "test_yf001",
+        }]
+      }
+    }
+    mock_detail_response = MagicMock()
+    mock_detail_response.status_code = 200
+    mock_detail_response.json.return_value = {
+      "code": 0,
+      "data": {"a461list": ["GB/T 31114-2024"]}
+    }
+    with patch.object(checker.session, 'post', return_value=mock_list_response):
+      with patch.object(checker.session, 'get', return_value=mock_detail_response):
+        with patch('core.time.sleep'):
+          with patch.object(checker, '_fetch_standard_name', return_value="冷冻饮品 冰淇淋"):
+            result = checker.query_single("GB/T 31114-2014")
+    self.assertEqual(result.状态, "已作废")
+    self.assertEqual(len(result.替代标准), 1)
+    self.assertEqual(result.替代标准[0].标准号, "GB/T 31114-2024")
+    self.assertEqual(result.替代标准号, "GB/T 31114-2024")
+
+  def test_query_single_active_skips_detail(self):
+    # 现行标准即使存在关联引用，也不查详情、不产生替代标准
+    checker = BaseStandardChecker(delay=0)
+    mock_list_response = MagicMock()
+    mock_list_response.status_code = 200
+    mock_list_response.json.return_value = {
+      "code": 0,
+      "data": {
+        "results": [{
+          "a000": "现行",
+          "a100": "GB/T 5009.37-2003",
+          "yf001": "test_yf001",
+        }]
+      }
+    }
+    with patch.object(checker.session, 'post', return_value=mock_list_response) as mock_post:
+      with patch.object(checker.session, 'get') as mock_get:
+        with patch('core.time.sleep'):
+          result = checker.query_single("GB/T 5009.37-2003")
+    self.assertEqual(result.状态, "现行有效")
+    self.assertEqual(result.替代标准, [])
+    mock_get.assert_not_called()
+    # list 请求之外不应有额外的替代标准名称查询
+    self.assertEqual(mock_post.call_count, 1)
+
   def test_proxy_setting(self):
     checker = BaseStandardChecker(use_proxy="http://127.0.0.1:7890")
     self.assertEqual(checker.session.proxies['http'], "http://127.0.0.1:7890")

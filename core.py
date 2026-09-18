@@ -40,6 +40,9 @@ STATUS_MAP = {
   "未生效": "未生效"
 }
 
+# 这些非现行终态需要查详情确认是否有替代标准（作废状态也可能带 a461list）
+REPLACEMENT_STATUSES = {"被代替", "作废", "废止", "已修订"}
+
 PROGRESS_VERSION = 2
 
 
@@ -315,7 +318,7 @@ class BaseStandardChecker:
         friendly_status = STATUS_MAP.get(status, status)
 
         replacement_list: List[ReplacementStandard] = []
-        if status == "被代替" and yf001:
+        if status in REPLACEMENT_STATUSES and yf001:
           replacement_list = self._get_replacements(yf001)
 
         self.stats.success += 1
