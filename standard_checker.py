@@ -131,6 +131,9 @@ class StandardChecker(BaseStandardChecker):
       for col in ['ndls状态', 'ndls查询时间', '替代标准号', '替代标准名']:
         if col not in df.columns:
           df[col] = ''
+        else:
+          # 预存的空输出列可能被读成 float64，统一转文本否则赋空串会报 TypeError
+          df[col] = df[col].astype('object').where(df[col].notna(), '')
 
       raw_nos = df['标准号'].dropna().astype(str).tolist()
       standard_nos = normalize_standard_nos(raw_nos)

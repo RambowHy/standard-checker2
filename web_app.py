@@ -19,6 +19,16 @@ from web_checker import WebStandardChecker
 
 OUTPUT_COLUMNS = ['ndls状态', 'ndls查询时间', '替代标准号', '替代标准名']
 
+
+def ensure_output_columns(df):
+  """确保输出列存在且为文本类型；空列从 Excel 读入时可能是 float64，赋空串会报错"""
+  for col in OUTPUT_COLUMNS:
+    if col not in df.columns:
+      df[col] = ''
+    else:
+      df[col] = df[col].astype('object').where(df[col].notna(), '')
+  return df
+
 st.set_page_config(
   page_title="国家标准状态查询",
   page_icon="📋",
@@ -242,9 +252,7 @@ def main():
           st.dataframe(df.head(10), use_container_width=True)
           st.caption(f"显示前10行，共{len(df)}行")
 
-        for col in OUTPUT_COLUMNS:
-          if col not in df.columns:
-            df[col] = ''
+        ensure_output_columns(df)
 
         df['标准号'] = df['标准号'].dropna().astype(str).map(str.strip)
 

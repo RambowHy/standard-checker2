@@ -634,6 +634,40 @@ class TestExcelUpdate(unittest.TestCase):
     self.assertEqual(result_df['ndls状态'].tolist(), ["现行有效", "现行有效", "已废止"])
     self.assertFalse(os.path.exists(dup_input + ".progress.pkl"))
 
+  def test_preexisting_empty_output_columns(self):
+    # 上传上次导出的文件：空输出列会被 pandas 读成 float64，回填空串不应报 TypeError
+    from standard_checker import StandardChecker
+    pre_input = os.path.join(self.tmpdir, "pre_input.xlsx")
+    pre_output = os.path.join(self.tmpdir, "pre_output.xlsx")
+
+    import pandas as pd
+    pd.DataFrame({
+      "标准号": ["GB 1", "GB 2"],
+      "ndls状态": [None, None],
+      "替代标准号": [None, None],
+      "替代标准名": [None, None],
+    }).to_excel(pre_input, index=False)
+
+    checker = StandardChecker(delay=0, max_retries=0)
+
+    def post_side_effect(url, json=None, timeout=None):
+      status = "现行" if json["a100"] == "GB 1" else "废止"
+      mock_response = MagicMock()
+      mock_response.status_code = 200
+      mock_response.json.return_value = {
+        "code": 0,
+        "data": {"results": [{"a000": status, "a100": json["a100"], "yf001": "y"}]},
+      }
+      return mock_response
+
+    with patch.object(checker.session, 'post', side_effect=post_side_effect):
+      with patch('core.time.sleep'):
+        checker.update_excel(pre_input, pre_output)
+
+    result_df = pd.read_excel(pre_output)
+    self.assertEqual(result_df['ndls状态'].tolist(), ["现行有效", "已废止"])
+    self.assertTrue(result_df['替代标准号'].isna().all())
+
 
 class TestModuleImports(unittest.TestCase):
   def test_core_import(self):
