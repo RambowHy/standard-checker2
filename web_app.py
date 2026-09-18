@@ -72,8 +72,13 @@ def fill_result_columns(df, results):
   return df
 
 
-def render_result_panel(df, checker, standard_nos, *, auto_clean=True):
+def render_result_panel(df, checker, standard_nos, *, results=None, auto_clean=True):
   """渲染统计、完整结果与下载；全部完成时自动清理进度"""
+  if results is None:
+    results = [checker.tracker.get_result(s) for s in standard_nos
+               if checker.tracker.is_completed(s)]
+  completed_count = len(results)
+
   st.subheader("📈 查询结果统计")
   col_stat1, col_stat2, col_stat3 = st.columns(3)
 
@@ -86,7 +91,6 @@ def render_result_panel(df, checker, standard_nos, *, auto_clean=True):
     st.metric("有替代标准的记录", replaced_count)
 
   with col_stat3:
-    completed_count = checker.tracker.completed_count()
     st.metric("已完成查询", f"{completed_count}/{len(standard_nos)}")
 
   with st.expander("👁️ 查看完整结果"):
@@ -95,53 +99,55 @@ def render_result_panel(df, checker, standard_nos, *, auto_clean=True):
   st.subheader("💾 下载结果")
   st.markdown(get_download_link(df), unsafe_allow_html=True)
 
-  if auto_clean and checker.tracker.completed_count() == len(standard_nos):
+  if auto_clean and completed_count == len(standard_nos):
     checker.tracker.clear()
     st.info("🗑️ 所有数据查询完毕，进度文件已自动清理")
 
 
-def render_progress_panel(df, standard_nos):
-  """后台线程执行查询，fragment 每秒轮询状态并支持取消"""
+def render_progress_panel():
+  """fragment 每秒轮询后台 job；结束/出错/取消时触发全页 rerun 以卸载本面板"""
   job = st.session_state.job
 
   @st.fragment(run_every=1.0)
   def panel():
-    if job['error'] is not None:
-      container.error(f"❌ 查询过程中出错: {job['error']}")
-      return
+    thread_alive = job['thread'].is_alive()
 
-    if not job['done'] and not job['cancel_event'].is_set():
-      if st.button("⏹️ 取消查询", type="secondary"):
-        job['cancel_event'].set()
-        st.rerun()
-      st.progress(job['progress'][0] / max(job['progress'][1], 1),
-                  text=f"⏳ {job['status_msg']}")
+    if job['state'] == 'error' or job['error'] is not None:
+      st.rerun()
+
+    if job['state'] in ('done', 'cancelled') and not thread_alive:
+      st.rerun()
+
+    if job['cancel_event'].is_set():
+      st.warning("⏹️ 正在停止，等待当前请求结束…")
       st.code('\n'.join(job['logs'][-20:]), language='text')
       return
 
-    if job['cancel_event'].is_set() and not job['done']:
-      st.warning("⏹️ 已取消，已完成条目已保存进度，重新点击「开始查询」可继续")
+    if st.button("⏹️ 取消查询", type="secondary"):
+      job['cancel_event'].set()
+      st.warning("⏹️ 正在停止，等待当前请求结束…")
+      st.code('\n'.join(job['logs'][-20:]), language='text')
       return
 
-    results = [job['checker'].tracker.get_result(s) for s in standard_nos
-               if job['checker'].tracker.is_completed(s)]
-    fill_result_columns(df, results)
-    render_result_panel(df, job['checker'], standard_nos)
+    st.progress(job['progress'][0] / max(job['progress'][1], 1),
+                text=f"⏳ {job['status_msg']}")
+    st.code('\n'.join(job['logs'][-20:]), language='text')
 
   panel()
 
 
-def start_job(checker, pending_nos):
+def start_job(checker, pending_nos, standard_nos):
   """在后台线程中启动批量查询，线程间通过共享 job 字典传递状态"""
   job = {
     'checker': checker,
-    'done': False,
+    'state': 'running',
     'error': None,
     'cancel_event': threading.Event(),
     'progress': (0, len(pending_nos)),
     'status_msg': "准备中...",
     'logs': [],
-    'df': None,
+    'results': [],
+    'thread': None,
   }
 
   def worker():
@@ -153,12 +159,21 @@ def start_job(checker, pending_nos):
         log_callback=lambda msg: job['logs'].append(msg),
         should_stop=job['cancel_event'].is_set,
       )
-      if not job['cancel_event'].is_set():
-        job['done'] = True
+      if job['cancel_event'].is_set():
+        job['state'] = 'cancelled'
+      else:
+        job['results'] = [
+          checker.tracker.get_result(s) for s in standard_nos
+          if checker.tracker.is_completed(s)
+        ]
+        job['state'] = 'done'
     except Exception as e:
       job['error'] = str(e)
+      job['state'] = 'error'
 
-  threading.Thread(target=worker, daemon=True).start()
+  thread = threading.Thread(target=worker, daemon=True)
+  job['thread'] = thread
+  thread.start()
   st.session_state.job = job
 
 
@@ -267,12 +282,6 @@ def main():
     clear_button = st.button("🔄 重置进度", use_container_width=True)
 
   job = st.session_state.get('job')
-  if job is not None and not job['done'] and job['error'] is None:
-    if job['cancel_event'].is_set():
-      st.warning("⏹️ 已取消，已完成条目已保存进度，重新点击「开始查询」可继续")
-      return
-    render_progress_panel(df, standard_nos)
-    return
 
   if clear_button:
     session_checker = st.session_state.get('checker')
@@ -285,28 +294,52 @@ def main():
     st.rerun()
 
   if start_button:
-    proxy = use_proxy if use_proxy else None
-    checker = WebStandardChecker(
-      delay=delay, max_retries=max_retries, use_proxy=proxy,
-      progress_file=progress_file,
-    )
-    st.session_state.checker = checker
+    old_job = st.session_state.get('job')
+    if old_job is not None and old_job['thread'].is_alive():
+      st.warning("上一个查询正在停止，请等待几秒后再点击「开始查询」")
+    else:
+      proxy = use_proxy if use_proxy else None
+      checker = WebStandardChecker(
+        delay=delay, max_retries=max_retries, use_proxy=proxy,
+        progress_file=progress_file,
+      )
+      st.session_state.checker = checker
 
-    pending_nos = [s for s in standard_nos if not checker.tracker.is_completed(s)]
-    skipped = len(standard_nos) - len(pending_nos)
+      pending_nos = [s for s in standard_nos if not checker.tracker.is_completed(s)]
+      skipped = len(standard_nos) - len(pending_nos)
 
-    if skipped > 0:
-      st.info(f"⏭️ 跳过已完成的 {skipped} 条记录，剩余 {len(pending_nos)} 条待查询")
+      if skipped > 0:
+        st.info(f"⏭️ 跳过已完成的 {skipped} 条记录，剩余 {len(pending_nos)} 条待查询")
 
-    if not pending_nos:
-      results = [checker.tracker.get_result(s) for s in standard_nos
-                 if checker.tracker.is_completed(s)]
-      fill_result_columns(df, results)
-      render_result_panel(df, checker, standard_nos)
-      return
+      if not pending_nos:
+        results = [checker.tracker.get_result(s) for s in standard_nos
+                   if checker.tracker.is_completed(s)]
+        fill_result_columns(df, results)
+        render_result_panel(df, checker, standard_nos, results=results)
+        return
 
-    start_job(checker, pending_nos)
-    st.rerun()
+      st.session_state.pop('job', None)
+      start_job(checker, pending_nos, standard_nos)
+      st.rerun()
+
+  if job is None:
+    return
+
+  if job['state'] == 'running' or (job['state'] != 'error' and job['thread'].is_alive()):
+    render_progress_panel()
+    return
+
+  if job['state'] == 'error' or job['error'] is not None:
+    st.error(f"❌ 查询过程中出错: {job['error']}")
+    return
+
+  if job['state'] == 'cancelled':
+    st.warning("⏹️ 已取消，已完成条目已保存进度，再次点击「开始查询」可继续")
+    return
+
+  if job['state'] == 'done':
+    fill_result_columns(df, job['results'])
+    render_result_panel(df, job['checker'], standard_nos, results=job['results'])
 
 
 if __name__ == "__main__":
