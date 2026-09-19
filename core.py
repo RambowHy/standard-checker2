@@ -13,7 +13,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import requests
 
@@ -42,6 +42,16 @@ STATUS_MAP = {
 
 # 这些非现行终态需要查详情确认是否有替代标准（作废状态也可能带 a461list）
 REPLACEMENT_STATUSES = {"被代替", "作废", "废止", "已修订"}
+
+# 触发限流后的冷却重试等待（秒）：约 60/120/180，封顶 180
+RATE_LIMIT_COOLDOWN = 60.0
+RATE_LIMIT_COOLDOWN_MAX = 180.0
+# 连续多少条限流即熔断（停止本轮，避免加重封禁）
+CONSECUTIVE_RATE_LIMIT_BREAK = 3
+# 整轮结束后对限流条目慢速补查前的等待（秒）
+RECOVERY_ROUND_WAIT = 60.0
+# 限流条目最终失败时写入结果的统一原因
+RATE_LIMIT_FAIL_MSG = "限流，未完成，请重新运行续查"
 
 PROGRESS_VERSION = 2
 
@@ -83,6 +93,20 @@ class QueryStats:
     self.failed = 0
     self.rate_limited = 0
     self.start_time = None
+
+
+@dataclass
+class BatchOutcome:
+  """批量查询结果"""
+  results: List[StandardResult] = field(default_factory=list)
+  failures: dict = field(default_factory=dict)
+  rate_limited: set = field(default_factory=set)
+  cancelled: bool = False
+
+  @property
+  def failure_results(self) -> List[StandardResult]:
+    """把失败条目也转为 StandardResult，便于统一回填"""
+    return [StandardResult(标准号=no, 错误=err) for no, err in self.failures.items()]
 
 
 def normalize_standard_nos(raw_nos: List[str]) -> List[str]:
@@ -207,6 +231,28 @@ class BaseStandardChecker:
     return self.delay + random.uniform(-span, span)
 
   @staticmethod
+  def _is_rate_limit_message(message: str) -> bool:
+    return ('限流' in message) or ('验证码' in message)
+
+  def _rate_limit_cooldown(self, retry_count: int) -> float:
+    """限流冷却等待，指数增长并封顶，带 ±20% 抖动"""
+    base = min(RATE_LIMIT_COOLDOWN * (2 ** (retry_count - 1)), RATE_LIMIT_COOLDOWN_MAX)
+    return base * random.uniform(0.8, 1.2)
+
+  @staticmethod
+  def _interruptible_sleep(seconds: float,
+                           should_stop: Optional[Callable[[], bool]] = None) -> bool:
+    """分片睡眠以便取消；返回 True 表示被中断"""
+    remaining = seconds
+    while remaining > 0:
+      if should_stop is not None and should_stop():
+        return True
+      step = min(1.0, remaining)
+      time.sleep(step)
+      remaining -= step
+    return should_stop is not None and should_stop()
+
+  @staticmethod
   def _parse_replacement_nos(raw_list: List[str]) -> List[str]:
     """从原始替代文本中提取标准号"""
     replacement_nos = []
@@ -255,21 +301,28 @@ class BaseStandardChecker:
       pass
     return ""
 
-  def query_single(self, standard_no: str, sleep_after: bool = True) -> StandardResult:
+  def query_single(self, standard_no: str, sleep_after: bool = True,
+                   should_stop: Optional[Callable[[], bool]] = None) -> StandardResult:
     """
     查询单个标准
 
     Args:
       standard_no: 标准号，如 "GB 2757-2012"
       sleep_after: 查询成功后是否按 delay 等待（批量查询时最后一条传 False）
+      should_stop: 取消检查，冷却/等待期间被置位则尽快返回“已取消”
 
     Returns:
-      StandardResult
+      StandardResult（限流重试耗尽时错误为 RATE_LIMIT_FAIL_MSG）
     """
     retry_count = 0
     last_error: Optional[str] = None
+    hit_rate_limit = False
 
     while retry_count <= self.max_retries:
+      if should_stop is not None and should_stop():
+        self.stats.failed += 1
+        return StandardResult(标准号=standard_no, 错误="已取消")
+
       try:
         if retry_count > 0:
           self._update_headers()
@@ -279,15 +332,17 @@ class BaseStandardChecker:
 
         if response.status_code != 200:
           last_error = f"HTTP错误 {response.status_code}"
-          if response.status_code == 429 or response.status_code >= 500:
-            self.stats.rate_limited += 1
+          rate_limited = response.status_code == 429
+          hit_rate_limit = hit_rate_limit or rate_limited
+          if rate_limited or response.status_code >= 500:
             retry_count += 1
             if retry_count <= self.max_retries:
-              wait_time = self._calculate_wait_time(retry_count)
-              time.sleep(wait_time)
+              if self._wait_retry(retry_count, rate_limited, should_stop):
+                return StandardResult(标准号=standard_no, 错误="已取消")
               continue
           self.stats.failed += 1
-          return StandardResult(标准号=standard_no, 错误=last_error)
+          err = RATE_LIMIT_FAIL_MSG if rate_limited else last_error
+          return StandardResult(标准号=standard_no, 错误=err)
 
         result = response.json()
 
@@ -295,14 +350,16 @@ class BaseStandardChecker:
           error_msg = result.get('message', '未知错误')
           last_error = f"API错误: {error_msg}"
 
-          if '限流' in error_msg or '验证码' in error_msg:
-            self.stats.rate_limited += 1
+          if self._is_rate_limit_message(error_msg):
             retry_count += 1
             if retry_count <= self.max_retries:
-              wait_time = self._calculate_wait_time(retry_count)
-              logger.warning("触发限流，等待 %.1f 秒后重试 (%d/%d)...", wait_time, retry_count, self.max_retries)
-              time.sleep(wait_time)
+              logger.warning("触发限流，冷却 %.0f 秒后重试 (%d/%d)...",
+                             RATE_LIMIT_COOLDOWN, retry_count, self.max_retries)
+              if self._wait_retry(retry_count, True, should_stop):
+                return StandardResult(标准号=standard_no, 错误="已取消")
               continue
+            self.stats.failed += 1
+            return StandardResult(标准号=standard_no, 错误=RATE_LIMIT_FAIL_MSG)
 
           self.stats.failed += 1
           return StandardResult(标准号=standard_no, 错误=last_error)
@@ -322,8 +379,8 @@ class BaseStandardChecker:
           replacement_list = self._get_replacements(yf001)
 
         self.stats.success += 1
-        if sleep_after:
-          time.sleep(self._random_delay())
+        if sleep_after and not self._interruptible_sleep(self._random_delay(), should_stop):
+          pass
         return StandardResult(
           标准号=standard_no,
           状态=friendly_status,
@@ -334,8 +391,8 @@ class BaseStandardChecker:
         last_error = "查询超时"
         retry_count += 1
         if retry_count <= self.max_retries:
-          wait_time = self._calculate_wait_time(retry_count)
-          time.sleep(wait_time)
+          if self._wait_retry(retry_count, False, should_stop):
+            return StandardResult(标准号=standard_no, 错误="已取消")
           continue
         self.stats.failed += 1
         return StandardResult(标准号=standard_no, 错误=last_error)
@@ -344,8 +401,8 @@ class BaseStandardChecker:
         last_error = f"请求异常: {e}"
         retry_count += 1
         if retry_count <= self.max_retries:
-          wait_time = self._calculate_wait_time(retry_count)
-          time.sleep(wait_time)
+          if self._wait_retry(retry_count, False, should_stop):
+            return StandardResult(标准号=standard_no, 错误="已取消")
           continue
         self.stats.failed += 1
         return StandardResult(标准号=standard_no, 错误=last_error)
@@ -356,4 +413,131 @@ class BaseStandardChecker:
         return StandardResult(标准号=standard_no, 错误=last_error)
 
     self.stats.failed += 1
+    if hit_rate_limit:
+      return StandardResult(标准号=standard_no, 错误=RATE_LIMIT_FAIL_MSG)
     return StandardResult(标准号=standard_no, 错误=last_error or "超过最大重试次数")
+
+  def _wait_retry(self, retry_count: int, rate_limited: bool,
+                  should_stop: Optional[Callable[[], bool]] = None) -> bool:
+    """重试等待；限流走长冷却，其他错误走短退避。返回 True 表示被取消"""
+    if rate_limited:
+      self.stats.rate_limited += 1
+      wait_time = self._rate_limit_cooldown(retry_count)
+    else:
+      wait_time = self._calculate_wait_time(retry_count)
+    return self._interruptible_sleep(wait_time, should_stop)
+
+  def _run_recovery_batch(
+    self,
+    standard_nos: List[str],
+    tracker: Optional[ProgressTracker] = None,
+    *,
+    resume: bool = True,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    on_log: Optional[Callable[[str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    recovery_wait: float = RECOVERY_ROUND_WAIT,
+  ) -> BatchOutcome:
+    """批量查询编排：主轮熔断 + 限流条目当轮慢速补查一次"""
+    def log(msg: str):
+      if on_log:
+        on_log(msg)
+      else:
+        logger.info(msg)
+
+    standard_nos = normalize_standard_nos(standard_nos)
+    outcome = BatchOutcome()
+    self.stats.reset()
+    self.stats.start_time = time.time()
+
+    pending_nos = standard_nos
+    if resume and tracker:
+      pending_nos = [s for s in standard_nos if not tracker.is_completed(s)]
+      skipped = len(standard_nos) - len(pending_nos)
+      if skipped:
+        log(f"[进度] 跳过已完成的 {skipped} 条，剩余 {len(pending_nos)} 条待查询")
+
+    total = len(pending_nos)
+    consecutive_rate_limited = 0
+    circuit_broken = False
+
+    def query_one(no: str, idx: int, total_in_round: int) -> StandardResult:
+      if on_progress:
+        on_progress(idx, total_in_round, no)
+      result = self.query_single(
+        no,
+        sleep_after=(idx < total_in_round),
+        should_stop=should_stop,
+      )
+      return result
+
+    for i, no in enumerate(pending_nos, 1):
+      if should_stop is not None and should_stop():
+        outcome.cancelled = True
+        break
+
+      result = query_one(no, i, total)
+
+      if result.错误:
+        is_rate = result.错误 == RATE_LIMIT_FAIL_MSG
+        if result.错误 == "已取消":
+          outcome.cancelled = True
+          break
+        if is_rate:
+          outcome.failures[no] = result.错误
+          outcome.rate_limited.add(no)
+          consecutive_rate_limited += 1
+          log(f"❌ {no}: 触发限流，先跳过")
+          if consecutive_rate_limited >= CONSECUTIVE_RATE_LIMIT_BREAK:
+            log("⛔ 连续触发限流，熔断本轮查询以避免加重封禁，稍后可续跑")
+            circuit_broken = True
+            break
+        else:
+          outcome.failures[no] = result.错误
+          log(f"❌ {no}: {result.错误}")
+      else:
+        consecutive_rate_limited = 0
+        outcome.failures.pop(no, None)
+        outcome.rate_limited.discard(no)
+        if tracker:
+          tracker.mark_completed(no, result)
+        else:
+          outcome.results.append(result)
+        detail = f" (替代: {result.替代标准号})" if result.替代标准 else ""
+        log(f"✅ {no}: {result.状态}{detail}")
+
+    # 补查轮：对限流条目慢速重试一次（熔断时不再补查）
+    if (not outcome.cancelled and not circuit_broken and outcome.rate_limited
+            and (should_stop is None or not should_stop())):
+      retry_nos = [s for s in pending_nos if s in outcome.rate_limited]
+      if retry_nos:
+        log(f"[补查] 等待 {int(recovery_wait)} 秒后，对 {len(retry_nos)} 条限流条目补查…")
+        if self._interruptible_sleep(recovery_wait, should_stop):
+          outcome.cancelled = True
+        else:
+          for i, no in enumerate(retry_nos, 1):
+            if should_stop is not None and should_stop():
+              outcome.cancelled = True
+              break
+            result = query_one(no, i, len(retry_nos))
+            if result.错误:
+              if result.错误 == "已取消":
+                outcome.cancelled = True
+                break
+              outcome.failures[no] = result.错误
+              log(f"❌ {no}: 仍{result.错误}")
+            else:
+              outcome.failures.pop(no, None)
+              outcome.rate_limited.discard(no)
+              if tracker:
+                tracker.mark_completed(no, result)
+              else:
+                outcome.results.append(result)
+              log(f"✅ {no}: 补查成功 {result.状态}")
+
+    # 从 tracker 汇总成功结果（含历史进度）
+    if tracker:
+      outcome.results = [tracker.get_result(s) for s in standard_nos
+                         if tracker.is_completed(s)]
+
+    return outcome

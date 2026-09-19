@@ -14,7 +14,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from core import ProgressTracker, normalize_standard_nos
+from core import BatchOutcome, ProgressTracker, normalize_standard_nos
 from web_checker import WebStandardChecker
 
 OUTPUT_COLUMNS = ['ndls状态', 'ndls查询时间', '替代标准号', '替代标准名']
@@ -68,26 +68,36 @@ def get_download_link(df, filename="查询结果.xlsx"):
   )
 
 
-def fill_result_columns(df, results):
-  """把查询结果按标准号回填到 DataFrame（重复行全部回填）"""
+def fill_result_columns(df, outcome):
+  """把查询结果与失败原因回填到 DataFrame（重复行全部回填）"""
   now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-  result_map = {r.标准号: r for r in results}
-  matched = df['标准号'].isin(result_map.keys())
+  result_map = {r.标准号: r for r in outcome.results}
+  failure_map = dict(outcome.failures)
+  matched = df['标准号'].isin(set(result_map) | set(failure_map))
   for idx in df[matched].index:
-    result = result_map[df.at[idx, '标准号']]
-    df.at[idx, 'ndls状态'] = result.错误 or result.状态 or ""
+    no = df.at[idx, '标准号']
+    if no in result_map:
+      result = result_map[no]
+      df.at[idx, 'ndls状态'] = result.错误 or result.状态 or ""
+      df.at[idx, '替代标准号'] = result.替代标准号
+      df.at[idx, '替代标准名'] = result.替代标准名
+    else:
+      df.at[idx, 'ndls状态'] = failure_map[no]
     df.at[idx, 'ndls查询时间'] = now_str
-    df.at[idx, '替代标准号'] = result.替代标准号
-    df.at[idx, '替代标准名'] = result.替代标准名
   return df
 
 
-def render_result_panel(df, checker, standard_nos, *, results=None, auto_clean=True):
-  """渲染统计、完整结果与下载；全部完成时自动清理进度"""
-  if results is None:
+def render_result_panel(df, checker, standard_nos, *, outcome=None, auto_clean=True):
+  """渲染统计、完整结果与下载；全部成功时自动清理进度"""
+  if outcome is None:
     results = [checker.tracker.get_result(s) for s in standard_nos
                if checker.tracker.is_completed(s)]
-  completed_count = len(results)
+    outcome = BatchOutcome(results=results)
+  success_count = len(outcome.results)
+  rate_fail_count = len(outcome.rate_limited)
+  total = len(standard_nos)
+
+  fill_result_columns(df, outcome)
 
   st.subheader("📈 查询结果统计")
   col_stat1, col_stat2, col_stat3 = st.columns(3)
@@ -101,7 +111,7 @@ def render_result_panel(df, checker, standard_nos, *, results=None, auto_clean=T
     st.metric("有替代标准的记录", replaced_count)
 
   with col_stat3:
-    st.metric("已完成查询", f"{completed_count}/{len(standard_nos)}")
+    st.metric("成功查询", f"{success_count}/{total}")
 
   with st.expander("👁️ 查看完整结果"):
     st.dataframe(df, use_container_width=True)
@@ -109,9 +119,12 @@ def render_result_panel(df, checker, standard_nos, *, results=None, auto_clean=T
   st.subheader("💾 下载结果")
   st.markdown(get_download_link(df), unsafe_allow_html=True)
 
-  if auto_clean and completed_count == len(standard_nos):
-    checker.tracker.clear()
+  if success_count == total:
+    if auto_clean:
+      checker.tracker.clear()
     st.info("🗑️ 所有数据查询完毕，进度文件已自动清理")
+  elif rate_fail_count:
+    st.warning(f"⚠️ 有 {rate_fail_count} 条因限流未完成，已保存进度，再次点击「开始查询」可续查")
 
 
 def render_progress_panel():
@@ -156,27 +169,21 @@ def start_job(checker, pending_nos, standard_nos):
     'progress': (0, len(pending_nos)),
     'status_msg': "准备中...",
     'logs': [],
-    'results': [],
+    'outcome': None,
     'thread': None,
   }
 
   def worker():
     try:
-      checker.query_batch_with_callback(
+      outcome = checker.query_batch_with_callback(
         pending_nos,
         progress_callback=lambda current, total, msg: job.update(
           progress=(current, total), status_msg=msg),
         log_callback=lambda msg: job['logs'].append(msg),
         should_stop=job['cancel_event'].is_set,
       )
-      if job['cancel_event'].is_set():
-        job['state'] = 'cancelled'
-      else:
-        job['results'] = [
-          checker.tracker.get_result(s) for s in standard_nos
-          if checker.tracker.is_completed(s)
-        ]
-        job['state'] = 'done'
+      job['outcome'] = outcome
+      job['state'] = 'cancelled' if outcome.cancelled else 'done'
     except Exception as e:
       job['error'] = str(e)
       job['state'] = 'error'
@@ -322,8 +329,8 @@ def main():
       if not pending_nos:
         results = [checker.tracker.get_result(s) for s in standard_nos
                    if checker.tracker.is_completed(s)]
-        fill_result_columns(df, results)
-        render_result_panel(df, checker, standard_nos, results=results)
+        outcome = BatchOutcome(results=results)
+        render_result_panel(df, checker, standard_nos, outcome=outcome)
         return
 
       st.session_state.pop('job', None)
@@ -342,12 +349,14 @@ def main():
     return
 
   if job['state'] == 'cancelled':
+    if job['outcome'] is not None and job['outcome'].results:
+      render_result_panel(df, job['checker'], standard_nos,
+                          outcome=job['outcome'], auto_clean=False)
     st.warning("⏹️ 已取消，已完成条目已保存进度，再次点击「开始查询」可继续")
     return
 
   if job['state'] == 'done':
-    fill_result_columns(df, job['results'])
-    render_result_panel(df, job['checker'], standard_nos, results=job['results'])
+    render_result_panel(df, job['checker'], standard_nos, outcome=job['outcome'])
 
 
 if __name__ == "__main__":

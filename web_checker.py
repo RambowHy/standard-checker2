@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 Web版国家标准查询模块
-适配Streamlit界面，支持实时进度回调
+适配Streamlit界面，支持实时进度回调、取消、限流熔断与补查
 """
 
-import time
 from datetime import timedelta
 from typing import Callable, List, Optional
 
 from core import (
   BaseStandardChecker,
+  BatchOutcome,
   ProgressTracker,
-  StandardResult,
-  normalize_standard_nos,
   logger,
 )
 
@@ -36,55 +34,38 @@ class WebStandardChecker(BaseStandardChecker):
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
-  ) -> List[StandardResult]:
+  ) -> BatchOutcome:
     """
-    带回调的批量查询
+    带回调的批量查询（自动 strip + 去重，含熔断与限流补查）
 
     Args:
-      standard_nos: 标准号列表（自动 strip + 去重）
+      standard_nos: 标准号列表
       progress_callback: 进度回调 (current, total, msg)
       log_callback: 日志回调 (msg)
-      should_stop: 每条查询前调用，返回 True 则中止批次
+      should_stop: 返回 True 则尽快中止（含冷却等待期间）
 
     Returns:
-      已完成的查询结果列表（StandardResult）
+      BatchOutcome
     """
-    standard_nos = normalize_standard_nos(standard_nos)
-    total = len(standard_nos)
-    self.stats.reset()
-    self.stats.start_time = time.time()
-
-    if not standard_nos:
-      return []
-
-    for i, standard_no in enumerate(standard_nos, 1):
-      if should_stop is not None and should_stop():
-        if log_callback:
-          log_callback("⏹️ 已取消，后续条目可重新点击开始继续")
-        break
-
-      elapsed = time.time() - self.stats.start_time
-      avg_time = elapsed / i if i > 0 else 0
-      remaining = total - i
-      eta_str = str(timedelta(seconds=int(avg_time * remaining)))
-
-      status_msg = f"[{i}/{total}] {standard_no} - ETA: {eta_str}"
-
-      if progress_callback:
-        progress_callback(i, total, status_msg)
-
-      if log_callback:
-        log_callback(f"正在查询: {standard_no}")
-
-      result = self.query_single(standard_no, sleep_after=(i < total))
-
-      if result.错误:
-        if log_callback:
-          log_callback(f"❌ {standard_no}: {result.错误}")
+    def on_progress(current, total, no):
+      if self.stats.start_time is not None:
+        import time
+        elapsed = time.time() - self.stats.start_time
+        avg_time = elapsed / current if current > 0 else 0
+        eta = str(timedelta(seconds=int(avg_time * (total - current))))
+        msg = f"[{current}/{total}] {no} - ETA: {eta}"
       else:
-        self.tracker.mark_completed(standard_no, result)
-        if log_callback:
-          log_callback(f"✅ {standard_no}: {result.状态}")
+        msg = f"[{current}/{total}] {no}"
+      if progress_callback:
+        progress_callback(current, total, msg)
 
-    return [self.tracker.get_result(s) for s in standard_nos
-            if self.tracker.is_completed(s)]
+    def on_log(msg):
+      if log_callback:
+        log_callback(msg)
+      else:
+        logger.info(msg)
+
+    return self._run_recovery_batch(
+      list(standard_nos), self.tracker,
+      on_progress=on_progress, on_log=on_log, should_stop=should_stop,
+    )

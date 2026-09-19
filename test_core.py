@@ -302,7 +302,8 @@ class TestBaseStandardChecker(unittest.TestCase):
       with patch('core.random.uniform', return_value=2.0):
         with patch('core.time.sleep') as mock_sleep:
           checker.query_single("GB 2757-2012", sleep_after=True)
-    mock_sleep.assert_called_once_with(7.0)
+    # 可中断睡眠按 1 秒分片，7 秒应调用 7 次 1 秒
+    self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [1.0] * 7)
 
   def test_query_single_replaced(self):
     checker = BaseStandardChecker(delay=0)
@@ -421,7 +422,8 @@ class TestCLIQuery(unittest.TestCase):
     }
     with patch.object(checker.session, 'post', return_value=mock_response):
       with patch('core.time.sleep'):
-        results = checker.query_batch(["GB 2757-2012"])
+        outcome = checker.query_batch(["GB 2757-2012"])
+    results = outcome.results
     self.assertEqual(len(results), 1)
     self.assertEqual(results[0].标准号, "GB 2757-2012")
     self.assertEqual(results[0].状态, "现行有效")
@@ -463,15 +465,16 @@ class TestResume(unittest.TestCase):
     tracker1 = ProgressTracker(self.progress_file)
     with patch.object(checker1.session, 'post', side_effect=post_side_effect):
       with patch('core.time.sleep'):
-        results1 = checker1.query_batch([all_nos[0]], tracker=tracker1)
-    self.assertEqual([r.标准号 for r in results1], [all_nos[0]])
+        outcome1 = checker1.query_batch([all_nos[0]], tracker=tracker1)
+    self.assertEqual([r.标准号 for r in outcome1.results], [all_nos[0]])
 
     # 第二轮：传入完整列表，已完成的应跳过且结果被带回
     checker2 = StandardChecker(delay=0)
     tracker2 = ProgressTracker(self.progress_file)
     with patch.object(checker2.session, 'post', side_effect=post_side_effect):
       with patch('core.time.sleep'):
-        results2 = checker2.query_batch(all_nos, tracker=tracker2)
+        outcome2 = checker2.query_batch(all_nos, tracker=tracker2)
+    results2 = outcome2.results
 
     self.assertEqual(queried, all_nos)
     self.assertEqual([r.标准号 for r in results2], all_nos)
@@ -566,14 +569,14 @@ class TestWebChecker(unittest.TestCase):
 
     with patch.object(checker.session, 'post', return_value=mock_response):
       with patch('core.time.sleep'):
-        results = checker.query_batch_with_callback(
+        outcome = checker.query_batch_with_callback(
           ["GB 2757-2012"],
           progress_callback=lambda c, t, m: progress_calls.append((c, t, m)),
           log_callback=lambda m: log_calls.append(m),
         )
 
-    self.assertEqual(len(results), 1)
-    self.assertEqual(results[0].状态, "现行有效")
+    self.assertEqual(len(outcome.results), 1)
+    self.assertEqual(outcome.results[0].状态, "现行有效")
     self.assertEqual(len(progress_calls), 1)
     self.assertTrue(len(log_calls) >= 1)
 
@@ -588,11 +591,12 @@ class TestWebChecker(unittest.TestCase):
     }
     with patch.object(checker.session, 'post', return_value=mock_response):
       with patch('core.time.sleep'):
-        results = checker.query_batch_with_callback(
+        outcome = checker.query_batch_with_callback(
           ["GB 2757-2012", "GB/T 8170-2008"],
           should_stop=lambda: True,
         )
-    self.assertEqual(results, [])
+    self.assertEqual(outcome.results, [])
+    self.assertTrue(outcome.cancelled)
     self.assertEqual(checker.tracker.completed_count(), 0)
 
   def test_normalize_and_dedupe(self):
@@ -612,11 +616,11 @@ class TestWebChecker(unittest.TestCase):
 
     with patch.object(checker.session, 'post', side_effect=post_side_effect):
       with patch('core.time.sleep'):
-        results = checker.query_batch_with_callback(
+        outcome = checker.query_batch_with_callback(
           [" GB 1 ", "GB 1", "", "GB 2"],
         )
     self.assertEqual(queried, ["GB 1", "GB 2"])
-    self.assertEqual([r.标准号 for r in results], ["GB 1", "GB 2"])
+    self.assertEqual([r.标准号 for r in outcome.results], ["GB 1", "GB 2"])
 
 
 class TestExcelUpdate(unittest.TestCase):
@@ -723,6 +727,156 @@ class TestExcelUpdate(unittest.TestCase):
     result_df = pd.read_excel(pre_output)
     self.assertEqual(result_df['ndls状态'].tolist(), ["现行有效", "已废止"])
     self.assertTrue(result_df['替代标准号'].isna().all())
+
+  def test_rate_limited_row_marked_with_reason(self):
+    from standard_checker import StandardChecker
+    from core import RATE_LIMIT_FAIL_MSG
+    rl_input = os.path.join(self.tmpdir, "rl_input.xlsx")
+    rl_output = os.path.join(self.tmpdir, "rl_output.xlsx")
+
+    import pandas as pd
+    pd.DataFrame({"标准号": ["GB 1", "GB 2"]}).to_excel(rl_input, index=False)
+
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": "现行", "a100": "GB 1", "yf001": "y"}]},
+    }
+    limited = MagicMock()
+    limited.status_code = 200
+    limited.json.return_value = {"code": 1, "message": "触发限流"}
+
+    checker = StandardChecker(delay=0, max_retries=0, jitter_ratio=0)
+    # 主轮 GB1 成功、GB2 限流；补查轮 GB2 仍限流
+    responses = iter([ok, limited, limited])
+
+    def wrapper(url, json=None, timeout=None):
+      return next(responses)
+
+    with patch.object(checker.session, 'post', side_effect=wrapper):
+      with patch('core.time.sleep'):
+        with patch.object(checker, '_rate_limit_cooldown', return_value=0.0):
+          checker.update_excel(rl_input, rl_output, recovery_wait=0)
+
+    result_df = pd.read_excel(rl_output)
+    statuses = result_df['ndls状态'].tolist()
+    self.assertEqual(statuses[0], "现行有效")
+    self.assertEqual(statuses[1], RATE_LIMIT_FAIL_MSG)
+
+
+class TestRateLimitHandling(unittest.TestCase):
+  """限流：长冷却重试、冷却中取消、5xx短退避、熔断、补查"""
+
+  def setUp(self):
+    self.tmpdir = tempfile.mkdtemp()
+
+  def tearDown(self):
+    for name in os.listdir(self.tmpdir):
+      os.remove(os.path.join(self.tmpdir, name))
+    os.rmdir(self.tmpdir)
+
+  def _rate_limited_response(self):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"code": 1, "message": "请求过于频繁，触发限流"}
+    return resp
+
+  def _ok_response(self, no="GB 1"):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+      "code": 0,
+      "data": {"results": [{"a000": "现行", "a100": no, "yf001": "y"}]},
+    }
+    return resp
+
+  def test_rate_limit_cooldown_then_success(self):
+    checker = BaseStandardChecker(delay=0, max_retries=3, jitter_ratio=0)
+    with patch.object(checker.session, 'post',
+                      side_effect=[self._rate_limited_response(), self._ok_response()]):
+      with patch('core.time.sleep') as mock_sleep:
+        with patch.object(checker, '_rate_limit_cooldown', return_value=60.0):
+          result = checker.query_single("GB 1", sleep_after=False)
+    self.assertIsNone(result.错误)
+    self.assertEqual(result.状态, "现行有效")
+    # 第一次限流冷却应等待 60 秒（可中断睡眠按 1 秒分片，共 60 次）
+    self.assertEqual(sum(c.args[0] for c in mock_sleep.call_args_list[:60]), 60.0)
+
+  def test_rate_limit_cooldown_interruptible(self):
+    stop = {"v": False}
+    checker = BaseStandardChecker(delay=0, max_retries=3, jitter_ratio=0)
+
+    def stop_after_first_sleep(*a, **k):
+      stop["v"] = True
+
+    with patch.object(checker.session, 'post',
+                      return_value=self._rate_limited_response()):
+      with patch('core.time.sleep', side_effect=stop_after_first_sleep):
+        with patch.object(checker, '_rate_limit_cooldown', return_value=60.0):
+          result = checker.query_single(
+            "GB 1", sleep_after=False, should_stop=lambda: stop["v"])
+    self.assertEqual(result.错误, "已取消")
+
+  def test_5xx_uses_short_backoff(self):
+    checker = BaseStandardChecker(delay=5.0, max_retries=1, jitter_ratio=0)
+    err_resp = MagicMock()
+    err_resp.status_code = 500
+    with patch.object(checker.session, 'post',
+                      side_effect=[err_resp, self._ok_response()]):
+      with patch('core.time.sleep') as mock_sleep:
+        with patch('core.random.uniform', return_value=0.0):
+          result = checker.query_single("GB 1", sleep_after=False)
+    self.assertIsNone(result.错误)
+    # 5xx 走短退避 delay*2^1 = 10 秒（10 个 1 秒分片）
+    self.assertEqual(sum(c.args[0] for c in mock_sleep.call_args_list[:10]), 10.0)
+
+  def test_rate_limit_exhausted_message(self):
+    checker = BaseStandardChecker(delay=0, max_retries=0, jitter_ratio=0)
+    with patch.object(checker.session, 'post',
+                      return_value=self._rate_limited_response()):
+      with patch('core.time.sleep'):
+        with patch('core.random.uniform', return_value=1.0):
+          result = checker.query_single("GB 1", sleep_after=False)
+    from core import RATE_LIMIT_FAIL_MSG
+    self.assertEqual(result.错误, RATE_LIMIT_FAIL_MSG)
+
+  def test_consecutive_rate_limits_triggers_circuit_break(self):
+    from core import CONSECUTIVE_RATE_LIMIT_BREAK
+    from standard_checker import StandardChecker
+    checker = StandardChecker(delay=0, max_retries=0, jitter_ratio=0)
+    nos = [f"GB {i}" for i in range(CONSECUTIVE_RATE_LIMIT_BREAK + 2)]
+    post_calls = []
+
+    def counting_post(*a, **k):
+      post_calls.append(k.get("json", {}).get("a100"))
+      return self._rate_limited_response()
+
+    with patch.object(checker.session, 'post', side_effect=counting_post):
+      with patch('core.time.sleep'):
+        with patch.object(checker, '_rate_limit_cooldown', return_value=0.0):
+          outcome = checker.query_batch(nos)
+    # 熔断后停止请求，只查了前 CONSECUTIVE_RATE_LIMIT_BREAK 条
+    self.assertEqual(len(post_calls), CONSECUTIVE_RATE_LIMIT_BREAK)
+    self.assertEqual(len(outcome.failures), CONSECUTIVE_RATE_LIMIT_BREAK)
+
+  def test_recovery_round_retries_rate_limited(self):
+    from standard_checker import StandardChecker
+    tracker = ProgressTracker(os.path.join(self.tmpdir, "rl.pkl"))
+    nos = ["GB 1", "GB 2"]
+    responses = [
+      self._ok_response("GB 1"),
+      self._rate_limited_response(),
+      self._ok_response("GB 2"),
+    ]
+    checker = StandardChecker(delay=0, max_retries=0, jitter_ratio=0)
+    with patch.object(checker.session, 'post', side_effect=responses) as mock_post:
+      with patch('core.time.sleep'):
+        with patch.object(checker, '_rate_limit_cooldown', return_value=0.0):
+          outcome = checker.query_batch(nos, tracker=tracker, recovery_wait=0)
+    self.assertEqual(len(outcome.results), 2)
+    self.assertEqual(outcome.failures, {})
+    self.assertEqual(mock_post.call_count, 3)
 
 
 class TestModuleImports(unittest.TestCase):

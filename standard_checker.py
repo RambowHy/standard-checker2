@@ -19,6 +19,7 @@ import pandas as pd
 
 from core import (
   BaseStandardChecker,
+  BatchOutcome,
   ProgressTracker,
   normalize_standard_nos,
   logger,
@@ -38,73 +39,32 @@ class StandardChecker(BaseStandardChecker):
   """CLI版国家标准查询器"""
 
   def query_batch(self, standard_nos: list, tracker: ProgressTracker = None,
-                  resume: bool = True) -> list:
-    """
-    批量查询标准
-
-    Args:
-      standard_nos: 标准号列表
-      tracker: 进度跟踪器
-      resume: 是否启用断点续传
-
-    Returns:
-      查询结果列表（StandardResult）
-    """
-    results: list = []
+                  resume: bool = True, recovery_wait: float = 60.0) -> BatchOutcome:
+    """批量查询（含熔断与限流补查），返回 BatchOutcome"""
     standard_nos = normalize_standard_nos(standard_nos)
-    total = len(standard_nos)
-    self.stats.reset()
-    self.stats.start_time = _now()
-
-    pending_nos = standard_nos
-    if resume and tracker:
-      pending_nos = [s for s in standard_nos if not tracker.is_completed(s)]
-      skipped = total - len(pending_nos)
-      if skipped > 0:
-        logger.info("[进度] 跳过已完成的 %d 条，剩余 %d 条待查询", skipped, len(pending_nos))
-
-    if not pending_nos:
-      logger.info("[完成] 所有标准已查询完毕")
-      if tracker:
-        return [tracker.get_result(s) for s in standard_nos if tracker.is_completed(s)]
-      return []
-
-    logger.info("\n开始查询 %d 个标准...", len(pending_nos))
-    logger.info("查询间隔: %.1f秒 | 最大重试: %d次", self.delay, self.max_retries)
+    logger.info("\n开始查询 %d 个标准...", len(standard_nos))
+    logger.info("查询间隔: %.1f秒 | 最大重试: %d次 | 限流冷却: %.0f秒",
+                self.delay, self.max_retries, 60)
     logger.info("-" * 100)
 
-    for i, standard_no in enumerate(pending_nos, 1):
+    def on_progress(idx, total, no):
       elapsed = _now() - self.stats.start_time
-      avg_time = elapsed / i if i > 0 else 0
-      remaining = len(pending_nos) - i
-      eta_str = str(timedelta(seconds=int(avg_time * remaining)))
+      avg_time = elapsed / idx if idx > 0 else 0
+      eta_str = str(timedelta(seconds=int(avg_time * (total - idx))))
+      logger.info("[%3d/%d] [%-25s] ETA: %s", idx, total, no, eta_str)
 
-      logger.info("[%3d/%d] [%-25s] ETA: %s", i, len(pending_nos), standard_no, eta_str)
-
-      result = self.query_single(standard_no, sleep_after=(i < len(pending_nos)))
-
-      if result.错误:
-        logger.info("=> 错误: %s", result.错误)
-      else:
-        if result.替代标准:
-          logger.info("=> %s (替代: %s)", result.状态, result.替代标准号)
-        else:
-          logger.info("=> %s", result.状态)
-        if tracker:
-          tracker.mark_completed(standard_no, result)
-
-      if not tracker:
-        results.append(result)
+    outcome = self._run_recovery_batch(
+      standard_nos, tracker, resume=resume, recovery_wait=recovery_wait,
+      on_progress=on_progress, on_log=logger.info,
+    )
 
     logger.info("-" * 100)
-    self._print_stats(len(pending_nos))
-
-    if tracker:
-      return [tracker.get_result(s) for s in standard_nos if tracker.is_completed(s)]
-    return results
+    self._print_stats(len(standard_nos), outcome)
+    return outcome
 
   def update_excel(self, input_file: str, output_file: str = None,
-                   resume: bool = True, clear_progress: bool = False):
+                   resume: bool = True, clear_progress: bool = False,
+                   recovery_wait: float = 60.0):
     """
     更新Excel文件
 
@@ -138,17 +98,23 @@ class StandardChecker(BaseStandardChecker):
       raw_nos = df['标准号'].dropna().astype(str).tolist()
       standard_nos = normalize_standard_nos(raw_nos)
       df['标准号'] = df['标准号'].dropna().astype(str).map(str.strip)
-      results = self.query_batch(standard_nos, tracker=tracker, resume=resume)
+      outcome = self.query_batch(standard_nos, tracker=tracker, resume=resume,
+                                 recovery_wait=recovery_wait)
 
       now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-      result_map = {r.标准号: r for r in results}
-      mask = df['标准号'].isin(result_map.keys())
-      for idx in df[mask].index:
-        result = result_map[df.at[idx, '标准号']]
-        df.at[idx, 'ndls状态'] = result.错误 or result.状态 or ""
+      result_map = {r.标准号: r for r in outcome.results}
+      failure_map = dict(outcome.failures)
+      matched = df['标准号'].isin(set(result_map) | set(failure_map))
+      for idx in df[matched].index:
+        no = df.at[idx, '标准号']
+        if no in result_map:
+          result = result_map[no]
+          df.at[idx, 'ndls状态'] = result.错误 or result.状态 or ""
+          df.at[idx, '替代标准号'] = result.替代标准号
+          df.at[idx, '替代标准名'] = result.替代标准名
+        else:
+          df.at[idx, 'ndls状态'] = failure_map[no]
         df.at[idx, 'ndls查询时间'] = now_str
-        df.at[idx, '替代标准号'] = result.替代标准号
-        df.at[idx, '替代标准名'] = result.替代标准名
 
       output_dir = os.path.dirname(os.path.abspath(output_file))
       fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=output_dir)
@@ -164,12 +130,14 @@ class StandardChecker(BaseStandardChecker):
       if replaced_count > 0:
         logger.info("\n发现 %d 个有替代标准的记录", replaced_count)
 
-      if tracker.completed_count() == len(standard_nos):
+      remaining = len(standard_nos) - tracker.completed_count()
+      if remaining == 0:
         tracker.clear()
         logger.info("\n[完成] 所有数据查询完毕，进度文件已清理")
+      elif outcome.cancelled:
+        logger.info("\n[取消] 已完成进度已保存，可重新运行续查剩余 %d 条", remaining)
       else:
-        logger.info("\n[提示] 还有 %d 条未查询，可重新运行继续",
-                     len(standard_nos) - tracker.completed_count())
+        logger.info("\n[提示] 还有 %d 条未查询（多为限流），可重新运行续查", remaining)
 
     except FileNotFoundError:
       logger.error("错误: 找不到文件 '%s'", input_file)
@@ -180,15 +148,24 @@ class StandardChecker(BaseStandardChecker):
       traceback.print_exc()
       sys.exit(1)
 
-  def _print_stats(self, total: int):
+  def _print_stats(self, total: int, outcome: BatchOutcome = None):
+    if self.stats.start_time is None:
+      return
     total_time = _now() - self.stats.start_time
     logger.info("\n查询统计:")
     logger.info("  总计: %d 条", total)
     logger.info("  成功: %d 条", self.stats.success)
-    logger.info("  失败: %d 条", self.stats.failed)
-    logger.info("  限流: %d 次", self.stats.rate_limited)
+    fail_count = self.stats.failed
+    if outcome is not None:
+      rate_fail = len(outcome.rate_limited)
+      fail_count = len(outcome.failures)
+      logger.info("  失败: %d 条（其中限流未完成 %d 条，可重跑续查）", fail_count, rate_fail)
+      if outcome.cancelled:
+        logger.info("  状态: 已取消")
+    else:
+      logger.info("  失败: %d 条", fail_count)
+    logger.info("  限流触发: %d 次", self.stats.rate_limited)
     logger.info("  耗时: %s", timedelta(seconds=int(total_time)))
-    logger.info("  平均: %.2f 秒/条", total_time / total)
 
 
 def _now() -> float:
@@ -224,7 +201,8 @@ def main():
 说明:
   - 程序自动保存进度，中断后可重新运行继续查询
   - 进度文件保存在输入文件同目录（.progress.pkl）
-  - 遇到限流会自动重试，最多3次，使用指数退避策略
+  - 遇到限流会长冷却重试（约60/120/180秒），连续限流自动熔断并在当轮慢速补查一次
+  - 仍未完成的条目结果标注“限流，未完成，请重新运行续查”，重跑自动续查
   - 实际查询间隔在 delay 基础上随机抖动（默认±50%），避免固定频率触发限流
         """
   )
@@ -257,13 +235,14 @@ def main():
       clear_progress=args.clear_progress,
     )
   else:
-    results = checker.query_batch(args.standards)
+    outcome = checker.query_batch(args.standards)
+    rows = outcome.results + outcome.failure_results
 
     logger.info("\n查询结果:")
     logger.info("=" * 100)
     logger.info("%-25s %-20s %s", "标准号", "状态", "替代标准")
     logger.info("-" * 100)
-    for r in results:
+    for r in rows:
       logger.info("%-25s %-20s %s", r.标准号, r.错误 or r.状态 or "", r.替代标准号)
     logger.info("=" * 100)
 
